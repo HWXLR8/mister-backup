@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# Flash a captured MiSTer image onto an SD card of any size (>= 30 GB).
+
+set -euo pipefail
+
+MIN=30000000000
+M=/mnt/mister-fl
+
+DRY=0
+[ "${1:-}" = --dry-run ] && { DRY=1; shift; }
+IMG=${1:-}
+TGT=${2:-}
+
+[ -n "$IMG" ] && [ -n "$TGT" ] || { echo "usage: $0 [--dry-run] IMAGE_DIR TARGET_DEVICE" >&2; exit 1; }
+[ -f "$IMG/SHA256SUMS" ] || { echo "not an image dir: $IMG" >&2; exit 1; }
+[ -b "$TGT" ] || { echo "no block device: $TGT" >&2; exit 1; }
+
+. "$IMG/meta.txt"
+case ${TGT##*/} in
+	*[0-9]) S=p ;;
+	*)      S='' ;;
+esac
+P1=$TGT${S}1
+P2=$TGT${S}2
+
+human() {
+	awk -v b="$1" 'BEGIN{split("B K M G T",a," ");i=1;
+		while(b>=1024&&i<5){b/=1024;i++}
+		printf (b>=10||i==1)?"%.0f%s":"%.1f%s",b,a[i]}'
+}
+
+D=/sys/block/${TGT##*/}
+wr() { awk '{print $7*512}' "$D/stat"; }
+rd() { awk '{print $3*512}' "$D/stat"; }
+measure() {
+	case $1 in
+		used)  df --output=used -B1 "$M" | tail -1 | tr -d ' ' ;;
+		wrote) wr ;;
+		read)  rd ;;
+		*)     echo 0 ;;
+	esac
+}
+
+# mon LABEL TOTAL MODE BASE T0 -- redraws one line until killed
+mon() {
+	local lab=$1 total=$2 mode=$3 base=$4 t0=$5 now el d pct bar
+	while :; do
+		now=$(date +%s); el=$((now - t0)); [ "$el" -lt 1 ] && el=1
+		[ "$mode" = none ] || d=$(( $(measure "$mode") - base ))
+		if [ "${mode}" = none ]; then
+			line=$(printf '%s  %ds' "$lab" "$el")
+		elif [ "$total" -gt 0 ] && [ "$d" -lt "$total" ]; then
+			pct=$((d * 100 / total))
+			bar=$(awk -v p="$pct" 'BEGIN{for(i=0;i<p*28/100;i++)s=s"#";printf "%s",s}')
+			line=$(printf '%s  [%-28s] %3d%%  %s/%s  %s/s  %ds' \
+				"$lab" "$bar" "$pct" "$(human "$d")" "$(human "$total")" "$(human $((d / el)))" "$el")
+		else
+			line=$(printf '%s  %s  %s/s  %ds' "$lab" "$(human "$d")" "$(human $((d / el)))" "$el")
+		fi
+		printf '\r%s\033[K' "$line" >&2
+		sleep 1
+	done
+}
+
+# phase LABEL TOTAL MODE -- runs remaining args with a live meter, then commits a line
+phase() {
+	local lab=$1 total=$2 mode=$3 t0 m rc=0 d
+	shift 3
+	t0=$(date +%s)
+	local base; base=$(measure "$mode")
+	if [ -t 2 ]; then mon "$lab" "$total" "$mode" "$base" "$t0" & m=$!; fi
+	"$@" || rc=$?
+	[ -n "${m:-}" ] && { kill "$m" 2>/dev/null || true; wait "$m" 2>/dev/null || true; }
+	[ "$mode" = none ] && d=0 || d=$(( $(measure "$mode") - base ))
+	LAST=$d
+	[ -t 2 ] && printf '\r\033[K' >&2
+	printf '%s %s %ss\n' "$lab" \
+		"$([ "$mode" = none ] && printf '' || human "$d")" "$(( $(date +%s) - t0 ))"
+	[ "$rc" = 0 ] || { echo "$lab failed" >&2; exit "$rc"; }
+}
+
+do_partition() {
+	wipefs -a "$TGT" >/dev/null
+	sfdisk -q "$TGT" 2>/dev/null <<EOF
+label: dos
+label-id: 0x$LABEL_ID
+unit: sectors
+sector-size: 512
+
+start=$HEAD_SECTORS, size=$p1z, type=7
+start=$p2s, size=$P2_SIZE, type=a2
+EOF
+	for _ in $(seq 20); do [ -b "$P1" ] && [ -b "$P2" ] && return 0; partx -u "$TGT" || true; sleep 0.3; done
+	[ -b "$P1" ] && [ -b "$P2" ]
+}
+do_write() {
+	dd if="$IMG/mbr.bin"  of="$TGT" bs=446 count=1 conv=notrunc status=none
+	dd if="$IMG/head.bin" of="$TGT" bs=512 seek=1 count=$((HEAD_SECTORS - 1)) conv=notrunc status=none
+	dd if="$IMG/p2.bin"   of="$TGT" bs=512 seek="$p2s" count="$P2_SIZE" conv=notrunc status=none
+	sync "$TGT"
+}
+do_extract() { tar --numeric-owner -xf <(zstd -dc "$IMG/p1.tar.zst") -C "$M"; }
+do_flush()   { umount "$M" || true; sync; }
+do_fsck()    { fsck.exfat -n "$P1" >/dev/null; }
+do_p2hash()  {
+	[ "$(dd if="$TGT" bs=512 skip="$p2s" count="$P2_SIZE" status=none | sha256sum | cut -d' ' -f1)" = \
+	  "$(sha256sum "$IMG/p2.bin" | cut -d' ' -f1)" ]
+}
+do_count()   { find "$M" -mindepth 1 | wc -l >"$CNT"; }
+
+printf 'hash'
+( cd "$IMG" && sha256sum -c --status SHA256SUMS ) || { echo " FAILED"; echo "image corrupt" >&2; exit 1; }
+echo " ok"
+
+[ -d "$D" ] || { echo "no sysfs for ${TGT##*/}" >&2; exit 1; }
+[ -z "$(ls -A "$D/holders" 2>/dev/null)" ] || { echo "$TGT in use (holders)" >&2; exit 1; }
+[ -z "$(lsblk -rno MOUNTPOINT "$TGT" | tr -d '\n')" ] || { echo "$TGT mounted" >&2; exit 1; }
+[ "$(cat "$D/queue/logical_block_size")" = 512 ] || { echo "sector size != 512" >&2; exit 1; }
+
+total=$(cat "$D/size")
+[ "$total" -ge $((MIN / 512)) ] || { echo "$TGT is $((total / 2097152)) GiB, need $((MIN / 1000000000)) GB" >&2; exit 1; }
+p2s=$((total - P2_SIZE))
+p1z=$((p2s - HEAD_SECTORS))
+cs=$( [ $((P1_CLUSTER % 1048576)) = 0 ] && echo "$((P1_CLUSTER / 1048576))M" || echo "$((P1_CLUSTER / 1024))K" )
+
+printf 'target %s  %.1f GiB\n' "$TGT" "$(awk -v t="$total" 'BEGIN{print t/2097152}')"
+printf '  p1  start=%s size=%s  exfat %s clusters label=%s\n' "$HEAD_SECTORS" "$p1z" "$cs" "$P1_LABEL"
+printf '  p2  start=%s size=%s  type=a2\n' "$p2s" "$P2_SIZE"
+[ "$DRY" = 1 ] && { echo "dry run, nothing written"; exit 0; }
+
+printf '\n%s\n' "$(lsblk -p -I 8,179,259,254 -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT,MODEL)"
+printf '\nALL DATA ON %s WILL BE DESTROYED. Type the device path to confirm: ' "$TGT"
+read -r ans
+[ "$ans" = "$TGT" ] || { echo "aborted"; exit 1; }
+
+T0=$(date +%s)
+CNT=$(mktemp)
+trap 'rm -f "$CNT"; umount "$M" 2>/dev/null || true; rmdir "$M" 2>/dev/null || true' EXIT
+
+phase 'partition' 0 none do_partition
+
+phase 'write head+p2' $((HEAD_SECTORS * 512 + P2_SIZE * 512)) wrote do_write
+phase 'format exfat' 0 none mkfs.exfat -q -F -s 512 -c "$cs" -L "$P1_LABEL" -P none "$P1"
+
+mkdir -p "$M"
+mount "$P1" "$M"
+phase 'extract files' "${CONTENT_BYTES:-0}" used do_extract
+used=$LAST
+
+phase 'flush card' "$used" wrote do_flush
+phase 'check filesystem' "$used" read do_fsck
+phase 'check p2 hash' $((P2_SIZE * 512)) read do_p2hash
+
+mkdir -p "$M"
+mount -o ro "$P1" "$M"
+phase 'count files' "$FILE_COUNT" none do_count
+umount "$M"; rmdir "$M"
+n=$(cat "$CNT")
+[ "$n" = "$FILE_COUNT" ] || { echo "file count $n != $FILE_COUNT" >&2; exit 1; }
+printf 'ok  %s files, p2 verified, %s ready  (%ss)\n' "$n" "$TGT" "$(( $(date +%s) - T0 ))"

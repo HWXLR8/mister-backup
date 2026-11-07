@@ -1,0 +1,99 @@
+#!/bin/bash
+
+# Capture a MiSTer SD card into a size-independent image directory.
+
+set -euo pipefail
+
+SRC=${1:-}
+OUT=${2:-$PWD/mister-image}
+M=/mnt/mister-cap
+
+[ -n "$SRC" ]   || { echo "usage: $0 SRC [OUTDIR]" >&2; exit 1; }
+[ -b "$SRC" ]   || { echo "no block device: $SRC" >&2; exit 1; }
+[ ! -e "$OUT" ] || { echo "refusing: $OUT exists" >&2; exit 1; }
+mountpoint -q "$OUT" && { echo "refusing: $OUT is a mount point" >&2; exit 1; }
+mountpoint -q "$M" && { echo "unmount $M" >&2; exit 1; }
+
+case ${SRC##*/} in
+	*[0-9]) S=p ;;
+	*)      S='' ;;
+esac
+P1=$SRC${S}1
+P2=$SRC${S}2
+
+human() {
+	awk -v b="$1" 'BEGIN{split("B K M G T",a," ");i=1;
+		while(b>=1024&&i<5){b/=1024;i++}
+		printf (b>=10||i==1)?"%.0f%s":"%.1f%s",b,a[i]}'
+}
+
+D=/sys/block/${SRC##*/}
+p1s=$(cat "$D/${P1##*/}/start"); p2s=$(cat "$D/${P2##*/}/start")
+p2z=$(cat "$D/${P2##*/}/size")
+id=$(sfdisk -d "$SRC" | sed -n 's/^label-id: 0x\([0-9a-f]*\).*/\1/p')
+bs=$(od -An -tu1 -j$((p1s * 512 + 0x6C)) -N1 "$SRC" | tr -d ' ')
+spc=$(od -An -tu1 -j$((p1s * 512 + 0x6D)) -N1 "$SRC" | tr -d ' ')
+cluster=$(( (1 << bs) * (1 << spc) ))
+label=$(blkid -o value -s LABEL "$P1")
+
+printf '%s  p1=%s  p2=%s+%s  exfat %sB  label=%s\n' "$SRC" "$p1s" "$p2s" "$p2z" "$cluster" "$label"
+
+mkdir -p "$OUT"
+dd if="$SRC" of="$OUT/mbr.bin"  bs=512 count=1 status=none
+dd if="$SRC" of="$OUT/head.bin" bs=512 skip=1 count=$((p1s - 1)) status=none
+dd if="$SRC" of="$OUT/p2.bin"   bs=512 skip="$p2s" count="$p2z" status=none
+printf 'head %s  p2 %s  ok\n' "$(human $((p1s * 512)))" "$(human $((p2z * 512)))"
+
+mkdir -p "$M"
+mount -o ro "$P1" "$M"
+umount_it() { mountpoint -q "$M" && umount "$M" || true; rmdir "$M" 2>/dev/null || true; }
+trap umount_it EXIT
+
+count=$(find "$M" -mindepth 1 | wc -l)
+bytes=$(du -sbx "$M" | cut -f1)
+printf 'scan %s files, %s\n' "$count" "$(human "$bytes")"
+
+F=$(mktemp -u /tmp/mister-cap.XXXXXX)
+mkfifo "$F"
+t0=$(date +%s)
+tar --numeric-owner -cf "$F" -C "$M" . &
+tp=$!
+zstd -12 -T0 -q <"$F" >"$OUT/p1.tar.zst" &
+zp=$!
+
+while kill -0 "$tp" 2>/dev/null; do
+	done=$(awk '{print $2; exit}' "/proc/$tp/io" 2>/dev/null || echo 0)
+	el=$(( $(date +%s) - t0 ))
+	pct=$((bytes > 0 && done < bytes ? done * 100 / bytes : 100))
+	if [ -t 2 ]; then
+		eta=$(( pct > 2 && el > 2 ? el * (100 - pct) / pct : 0 ))
+		printf '\rpack [%-30s] %3d%%  %s/%s  %s/s  eta %d:%02d\033[K' \
+			"$(awk -v p="$pct" 'BEGIN{for(i=0;i<p*30/100;i++)s=s"#";printf "%s",s}')" \
+			"$pct" "$(human "$done")" "$(human "$bytes")" \
+			"$(human $((el > 0 ? done / el : 0)))" $((eta / 60)) $((eta % 60)) >&2
+		sleep 1
+	else
+		printf 'pack %d%% %s/%s\n' "$pct" "$(human "$done")" "$(human "$bytes")" >&2
+		sleep 5
+	fi
+done
+wait "$tp"; wait "$zp"; rm -f "$F"
+[ -t 2 ] && printf '\r\033[K' >&2
+size=$(stat -c %s "$OUT/p1.tar.zst")
+printf 'pack %s -> %s (%d%%)  %ss\n' "$(human "$bytes")" "$(human "$size")" \
+	"$(( bytes > 0 ? size * 100 / bytes : 0 ))" "$(( $(date +%s) - t0 ))"
+umount "$M"; rmdir "$M"
+trap - EXIT
+
+cat >"$OUT/meta.txt" <<EOF
+HEAD_SECTORS=$p1s
+P1_CLUSTER=$cluster
+P1_LABEL=$label
+P2_SIZE=$p2z
+LABEL_ID=$id
+FILE_COUNT=$count
+CONTENT_BYTES=$bytes
+EOF
+
+( cd "$OUT" && sha256sum mbr.bin head.bin p2.bin p1.tar.zst meta.txt >SHA256SUMS )
+printf 'done %s -> %s\n' "$(du -sh "$OUT" | cut -f1)" "$OUT"
